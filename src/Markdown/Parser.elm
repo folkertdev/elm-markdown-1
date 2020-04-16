@@ -170,48 +170,50 @@ mapInline inline =
                     Block.Strong (inlines |> List.map mapInline)
 
 
-levelParser : Int -> Parser Block.HeadingLevel
-levelParser level =
+toHeadingLevel : Int -> Result Parser.Problem Block.HeadingLevel
+toHeadingLevel level =
     case level of
         1 ->
-            succeed Block.H1
+            Ok Block.H1
 
         2 ->
-            succeed Block.H2
+            Ok Block.H2
 
         3 ->
-            succeed Block.H3
+            Ok Block.H3
 
         4 ->
-            succeed Block.H4
+            Ok Block.H4
 
         5 ->
-            succeed Block.H5
+            Ok Block.H5
 
         6 ->
-            succeed Block.H6
+            Ok Block.H6
 
         _ ->
-            problem ("A heading with 1 to 6 #'s, but found " ++ String.fromInt level |> Parser.Expecting)
+            Err ("A heading with 1 to 6 #'s, but found " ++ String.fromInt level |> Parser.Expecting)
 
 
 parseInlines : LinkReferenceDefinitions -> RawBlock -> Parser (Maybe Block)
 parseInlines linkReferences rawBlock =
     case rawBlock of
         Heading level unparsedInlines ->
-            level
-                |> levelParser
-                |> map
-                    (\parsedLevel ->
-                        unparsedInlines
-                            |> inlineParseHelper linkReferences
-                            |> (\styledLine -> Just (Block.Heading parsedLevel styledLine))
-                    )
+            case toHeadingLevel level of
+                Ok parsedLevel ->
+                    inlineParseHelper linkReferences unparsedInlines
+                        |> Block.Heading parsedLevel
+                        |> Just
+                        |> succeed
+
+                Err err ->
+                    problem err
 
         Body unparsedInlines ->
             unparsedInlines
                 |> inlineParseHelper linkReferences
-                |> (\styledLine -> just (Block.Paragraph styledLine))
+                |> Block.Paragraph
+                |> just
 
         Html html ->
             Block.HtmlBlock html
@@ -240,14 +242,12 @@ parseInlines linkReferences rawBlock =
                                     Block.ListItem task parsedInlines
                                 )
                     )
-                |> map Block.UnorderedList
-                |> map Just
+                |> map (Block.UnorderedList >> Just)
 
         OrderedListBlock startingIndex unparsedInlines ->
             unparsedInlines
                 |> traverse (parseRawInline linkReferences identity)
-                |> map (Block.OrderedList startingIndex)
-                |> map Just
+                |> map (Block.OrderedList startingIndex >> Just)
 
         CodeBlock codeBlock ->
             Block.CodeBlock codeBlock
@@ -292,13 +292,6 @@ parseInlines linkReferences rawBlock =
                                             }
                                         )
                             )
-
-                --|> List.map (parseRawInline linkReferences identity)
-                --|> parseRawInline
-                --    linkReferences
-                --    (Debug.todo "")
-                --    (UnparsedInlines "")
-                --header
             in
             parsedHeader
                 |> map
@@ -468,7 +461,7 @@ nodeToRawBlock node =
                 parsedChildren : List Block
                 parsedChildren =
                     children
-                        |> List.map
+                        |> List.concatMap
                             (\child ->
                                 case child of
                                     HtmlParser.Text text ->
@@ -477,7 +470,6 @@ nodeToRawBlock node =
                                     _ ->
                                         [ nodeToRawBlock child |> Block.HtmlBlock ]
                             )
-                        |> List.concat
             in
             Block.HtmlElement tag
                 attributes
@@ -631,61 +623,48 @@ parseAllInlines state =
     Advanced.loop ( state.rawBlocks, [] ) looper
 
 
+possiblyMergeBlocks : State -> RawBlock -> State
+possiblyMergeBlocks state newRawBlock =
+    { linkReferenceDefinitions = state.linkReferenceDefinitions
+    , rawBlocks =
+        case
+            ( newRawBlock
+            , state.rawBlocks
+            )
+        of
+            ( CodeBlock block1, (CodeBlock block2) :: rest ) ->
+                CodeBlock
+                    { body = joinStringsPreserveAll block2.body block1.body
+                    , language = Nothing
+                    }
+                    :: rest
+
+            ( IndentedCodeBlock block1, (IndentedCodeBlock block2) :: rest ) ->
+                IndentedCodeBlock (joinStringsPreserveAll block2 block1)
+                    :: rest
+
+            ( Body (UnparsedInlines body1), (BlockQuote body2) :: rest ) ->
+                BlockQuote (joinRawStringsWith "\n" body2 body1)
+                    :: rest
+
+            ( BlockQuote body1, (BlockQuote body2) :: rest ) ->
+                BlockQuote (joinStringsPreserveAll body2 body1)
+                    :: rest
+
+            ( Body (UnparsedInlines body1), (Body (UnparsedInlines body2)) :: rest ) ->
+                Body (UnparsedInlines (joinRawStringsWith "\n" body2 body1))
+                    :: rest
+
+            _ ->
+                newRawBlock :: state.rawBlocks
+    }
+
+
 statementsHelp2 : State -> Parser (Step State State)
 statementsHelp2 revStmts =
     let
         keepLooping parser =
-            parser
-                |> map
-                    (\newRawBlock ->
-                        case
-                            ( newRawBlock
-                            , revStmts.rawBlocks
-                            )
-                        of
-                            ( CodeBlock block1, (CodeBlock block2) :: rest ) ->
-                                (CodeBlock
-                                    { body = joinStringsPreserveAll block2.body block1.body
-                                    , language = Nothing
-                                    }
-                                    :: rest
-                                )
-                                    |> updateRawBlocks revStmts
-                                    |> Loop
-
-                            ( IndentedCodeBlock block1, (IndentedCodeBlock block2) :: rest ) ->
-                                (IndentedCodeBlock (joinStringsPreserveAll block2 block1)
-                                    :: rest
-                                )
-                                    |> updateRawBlocks revStmts
-                                    |> Loop
-
-                            ( Body (UnparsedInlines body1), (BlockQuote body2) :: rest ) ->
-                                (BlockQuote (joinRawStringsWith "\n" body2 body1)
-                                    :: rest
-                                )
-                                    |> updateRawBlocks revStmts
-                                    |> Loop
-
-                            ( BlockQuote body1, (BlockQuote body2) :: rest ) ->
-                                (BlockQuote (joinStringsPreserveAll body2 body1)
-                                    :: rest
-                                )
-                                    |> updateRawBlocks revStmts
-                                    |> Loop
-
-                            ( Body (UnparsedInlines body1), (Body (UnparsedInlines body2)) :: rest ) ->
-                                (Body (UnparsedInlines (joinRawStringsWith "\n" body2 body1))
-                                    :: rest
-                                )
-                                    |> updateRawBlocks revStmts
-                                    |> Loop
-
-                            _ ->
-                                (newRawBlock :: revStmts.rawBlocks)
-                                    |> updateRawBlocks revStmts
-                                    |> Loop
-                    )
+            map (possiblyMergeBlocks revStmts) parser
 
         indentedCodeParser =
             case revStmts.rawBlocks of
@@ -694,11 +673,11 @@ statementsHelp2 revStmts =
 
                 _ ->
                     indentedCodeBlock
-                        |> keepLooping
     in
     oneOf
         [ Advanced.end (Parser.Expecting "End") |> map (\() -> Done revStmts)
-        , parseAsParagraphInsteadOfHtmlBlock |> keepLooping
+        , parseAsParagraphInsteadOfHtmlBlock
+            |> map (possiblyMergeBlocks revStmts >> Loop)
         , LinkReferenceDefinition.parser
             |> Advanced.backtrackable
             |> map
@@ -707,19 +686,23 @@ statementsHelp2 revStmts =
                         |> addReference revStmts
                         |> Loop
                 )
-        , blankLine |> keepLooping
-        , blockQuote |> keepLooping
-        , Markdown.CodeBlock.parser |> Advanced.backtrackable |> map CodeBlock |> keepLooping
-        , indentedCodeParser
-        , ThematicBreak.parser |> Advanced.backtrackable |> map (\_ -> ThematicBreak) |> keepLooping
-        , unorderedListBlock |> keepLooping
-        , orderedListBlock (List.head revStmts.rawBlocks) |> keepLooping
-        , heading |> Advanced.backtrackable |> keepLooping
-        , htmlParser |> keepLooping
+        , map (possiblyMergeBlocks revStmts >> Loop)
+            (oneOf
+                [ blankLine
+                , blockQuote
+                , Markdown.CodeBlock.parser |> Advanced.backtrackable |> map CodeBlock
+                , indentedCodeParser
+                , ThematicBreak.parser |> Advanced.backtrackable |> map (\_ -> ThematicBreak)
+                , unorderedListBlock
+                , orderedListBlock (List.head revStmts.rawBlocks)
+                , heading |> Advanced.backtrackable
+                , htmlParser
 
-        -- TODO re-enable this once the table parser handles rows
-        --, TableParser.parser |> Advanced.backtrackable |> map Table |> keepLooping
-        , plainLine |> keepLooping
+                -- TODO re-enable this once the table parser handles rows
+                --, TableParser.parser |> Advanced.backtrackable |> map Table
+                , plainLine
+                ]
+            )
         ]
 
 
@@ -731,20 +714,18 @@ autolinks are still parsed as paragraphs.
 parseAsParagraphInsteadOfHtmlBlock : Parser RawBlock
 parseAsParagraphInsteadOfHtmlBlock =
     -- ^<[A-Za-z][A-Za-z0-9.+-]{1,31}:[^<>\x00-\x20]*>
-    Advanced.succeed ()
-        |. token (Advanced.Token "<" (Parser.Expecting "<"))
+    token (Advanced.Token "<" (Parser.Expecting "<"))
         |. thisIsDefinitelyNotAnHtmlTag
         |. endOfLineOrFile
-        |> getChompedString
-        |> map (\rawLine -> rawLine |> UnparsedInlines |> Body)
+        |> Advanced.mapChompedString (\rawLine _ -> rawLine |> UnparsedInlines |> Body)
         |> Advanced.backtrackable
 
 
 endOfLineOrFile =
     Advanced.chompUntilEndOr "\n"
         |. oneOf
-            [ Advanced.symbol (Advanced.Token "\n" (Parser.ExpectingSymbol "\\n"))
-            , Advanced.end (Parser.Expecting "End of input")
+            [ Advanced.end (Parser.Expecting "End of input")
+            , Advanced.symbol (Advanced.Token "\n" (Parser.ExpectingSymbol "\\n"))
             ]
 
 
@@ -766,39 +747,22 @@ thisIsDefinitelyNotAnHtmlTag =
 
 
 joinStringsPreserveAll string1 string2 =
-    String.concat
-        [ string1
-        , "\n"
-        , string2
-        ]
+    string1 ++ "\n" ++ string2
 
 
 joinRawStringsWith joinWith string1 string2 =
     case ( string1, string2 ) of
         ( "", "" ) ->
-            String.concat
-                [ string1
-                , string2
-                ]
+            ""
 
         ( "", _ ) ->
-            String.concat
-                [ string1
-                , string2
-                ]
+            string2
 
         ( _, "" ) ->
-            String.concat
-                [ string1
-                , string2
-                ]
+            string1
 
         _ ->
-            String.concat
-                [ string1
-                , joinWith
-                , string2
-                ]
+            string1 ++ joinWith ++ string2
 
 
 indentedCodeBlock : Parser RawBlock
@@ -823,16 +787,15 @@ heading =
     succeed Heading
         |. symbol (Advanced.Token "#" (Parser.Expecting "#"))
         |= (getChompedString
-                (succeed ()
-                    |. chompWhile
-                        (\c ->
-                            case c of
-                                '#' ->
-                                    True
+                (chompWhile
+                    (\c ->
+                        case c of
+                            '#' ->
+                                True
 
-                                _ ->
-                                    False
-                        )
+                            _ ->
+                                False
+                    )
                 )
                 |> andThen
                     (\additionalHashes ->
@@ -849,9 +812,7 @@ heading =
            )
         |. chompWhile Helpers.isSpacebar
         |= (getChompedString
-                (succeed ()
-                    |. Advanced.chompUntilEndOr "\n"
-                )
+                (Advanced.chompUntilEndOr "\n")
                 |> Advanced.map
                     (\headingText ->
                         headingText

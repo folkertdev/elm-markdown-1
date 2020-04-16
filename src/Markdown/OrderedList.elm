@@ -77,7 +77,7 @@ openingItemParser lastBlock =
                 |. oneOrMore Helpers.isSpacebar
            )
         |= Advanced.getChompedString (Advanced.chompUntilEndOr "\n")
-        |. Advanced.symbol (Advanced.Token "\n" (Parser.ExpectingSymbol "\n"))
+        |. Parser.Extra.newline
 
 
 singleItemParser : String -> Parser ListItem
@@ -98,24 +98,18 @@ itemBody =
             |. commit ""
             |= Advanced.getChompedString (Advanced.chompUntilEndOr "\n")
             |. oneOf
-                [ Advanced.symbol (Advanced.Token "\n" (Parser.ExpectingSymbol "\\n"))
-                , Advanced.end (Parser.Expecting "End of input")
+                [ Parser.Extra.end
+                , Parser.Extra.newline
                 ]
         , succeed ""
-            |. Advanced.symbol (Advanced.Token "\n" (Parser.ExpectingSymbol "\\n"))
+            |. Parser.Extra.newline
         ]
 
 
 statementsHelp : String -> ListItem -> List ListItem -> Parser (Step (List ListItem) (List ListItem))
 statementsHelp listMarker firstItem revStmts =
     oneOf
-        [ succeed
-            (\offsetBefore stmt offsetAfter ->
-                Loop (stmt :: revStmts)
-            )
-            |= Advanced.getOffset
-            |= singleItemParser listMarker
-            |= Advanced.getOffset
-        , succeed ()
-            |> map (\_ -> Done (firstItem :: List.reverse revStmts))
+        [ singleItemParser listMarker
+            |> map (\stmt -> Loop (stmt :: revStmts))
+        , succeed (Done (firstItem :: List.reverse revStmts))
         ]

@@ -302,6 +302,7 @@ parseInlines linkReferences rawBlock =
                             InlineProblem error
 
                 Err error ->
+                    -- NOTE these errors have incorrect locations
                     InlineProblem (Parser.Problem (deadEndsToString error))
 
         IndentedCodeBlock codeBlockBody ->
@@ -332,13 +333,7 @@ parseRawInline linkReferences wrap unparsedInlines =
 
 plainLine : Parser RawBlock
 plainLine =
-    succeed
-        (\rawLine ->
-            rawLine
-                |> UnparsedInlines
-                |> Body
-        )
-        |= innerParagraphParser
+    innerParagraphParser
         |. oneOf
             [ Advanced.chompIf Helpers.isNewline (Parser.Expecting "A single non-newline char.")
             , Advanced.end (Parser.Expecting "End")
@@ -346,13 +341,18 @@ plainLine =
 
 
 innerParagraphParser =
-    getChompedString <|
-        succeed ()
-            |. Advanced.chompIf (\c -> not <| Helpers.isNewline c) (Parser.Expecting "Not newline.")
-            |. Advanced.chompUntilEndOr "\n"
+    Advanced.chompIf (\c -> not <| Helpers.isNewline c) (Parser.Expecting "Not newline.")
+        |. Advanced.chompUntilEndOr "\n"
+        |> Advanced.mapChompedString
+            (\rawLine _ ->
+                rawLine
+                    |> UnparsedInlines
+                    |> Body
+            )
 
 
 blockQuoteStart =
+    -- Investigate: can we re-order these? put the shortest matches first
     oneOf
         [ symbol (Advanced.Token "   > " (Parser.Expecting "   > "))
         , symbol (Advanced.Token "  > " (Parser.Expecting "  > "))
@@ -378,31 +378,29 @@ blockQuote =
 
 unorderedListBlock : Parser RawBlock
 unorderedListBlock =
+    let
+        toListItem unparsedListItem =
+            case unparsedListItem of
+                ListItem.TaskItem completion body ->
+                    { body = UnparsedInlines body
+                    , task =
+                        (case completion of
+                            ListItem.Complete ->
+                                True
+
+                            ListItem.Incomplete ->
+                                False
+                        )
+                            |> Just
+                    }
+
+                ListItem.PlainItem body ->
+                    { body = UnparsedInlines body
+                    , task = Nothing
+                    }
+    in
     Markdown.UnorderedList.parser
-        |> map
-            (List.map
-                (\unparsedListItem ->
-                    case unparsedListItem of
-                        ListItem.TaskItem completion body ->
-                            { body = UnparsedInlines body
-                            , task =
-                                (case completion of
-                                    ListItem.Complete ->
-                                        True
-
-                                    ListItem.Incomplete ->
-                                        False
-                                )
-                                    |> Just
-                            }
-
-                        ListItem.PlainItem body ->
-                            { body = UnparsedInlines body
-                            , task = Nothing
-                            }
-                )
-            )
-        |> map UnorderedListBlock
+        |> map (\items -> UnorderedListBlock (List.map toListItem items))
 
 
 orderedListBlock : Maybe RawBlock -> Parser RawBlock
@@ -514,21 +512,12 @@ nodeToRawBlock node =
 
 nodesToBlocksParser : List Node -> Result Parser.Problem (List Block)
 nodesToBlocksParser children =
+    -- Investigate: Rather than `childToParser` making many small lists,
+    -- then `concat`'ing them together, could we push all the elements onto the same list
+    -- essentially fusing the traverse and the concat
     children
         |> traverseResult childToParser
         |> Result.map List.concat
-
-
-traverse : (a -> Parser b) -> List a -> Parser (List b)
-traverse f =
-    let
-        folder : a -> Parser (List b) -> Parser (List b)
-        folder x accum =
-            Advanced.succeed (::)
-                |= f x
-                |= accum
-    in
-    List.foldr folder (Advanced.succeed [])
 
 
 traverseResult : (a -> Result x b) -> List a -> Result x (List b)
@@ -678,9 +667,6 @@ possiblyMergeBlocks state newRawBlock =
 statementsHelp2 : State -> Parser (Step State State)
 statementsHelp2 revStmts =
     let
-        keepLooping parser =
-            map (possiblyMergeBlocks revStmts) parser
-
         indentedCodeParser =
             case revStmts.rawBlocks of
                 (Body _) :: _ ->
@@ -826,10 +812,9 @@ heading =
                     )
            )
         |. chompWhile Helpers.isSpacebar
-        |= (getChompedString
-                (Advanced.chompUntilEndOr "\n")
-                |> Advanced.map
-                    (\headingText ->
+        |= (Advanced.chompUntilEndOr "\n"
+                |> Advanced.mapChompedString
+                    (\headingText _ ->
                         headingText
                             |> dropTrailingHashes
                             |> UnparsedInlines

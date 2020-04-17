@@ -49,7 +49,32 @@ But you can also do a lot with the `Block`s before passing them through:
 -}
 parse : String -> Result (List (Advanced.DeadEnd String Parser.Problem)) (List Block)
 parse input =
-    Advanced.run multiParser2 input
+    case Advanced.run (rawBlockParser |. succeed Advanced.end) input of
+        Err e ->
+            Err e
+
+        Ok v ->
+            case parseAllInlines v of
+                Err e ->
+                    -- NOTE these messages get an incorrect location
+                    -- but they always did, because the inlines are not parsed in the original source string.
+                    -- Rather the blocks are sliced from the source string, then parsed. So the errors in that sliced
+                    -- string would not map correctly to locations in the original source string
+                    Advanced.run (problem e) ""
+
+                Ok items ->
+                    Ok
+                        (List.filter
+                            (\item ->
+                                case item of
+                                    Block.Paragraph [] ->
+                                        False
+
+                                    _ ->
+                                        True
+                            )
+                            items
+                        )
 
 
 deadEndsToString : List (Advanced.DeadEnd String Parser.Problem) -> String
@@ -195,7 +220,7 @@ toHeadingLevel level =
             Err ("A heading with 1 to 6 #'s, but found " ++ String.fromInt level |> Parser.Expecting)
 
 
-parseInlines : LinkReferenceDefinitions -> RawBlock -> Parser (Maybe Block)
+parseInlines : LinkReferenceDefinitions -> RawBlock -> Result Parser.Problem (Maybe Block)
 parseInlines linkReferences rawBlock =
     case rawBlock of
         Heading level unparsedInlines ->
@@ -204,20 +229,22 @@ parseInlines linkReferences rawBlock =
                     inlineParseHelper linkReferences unparsedInlines
                         |> Block.Heading parsedLevel
                         |> Just
-                        |> succeed
+                        |> Ok
 
                 Err err ->
-                    problem err
+                    Err err
 
         Body unparsedInlines ->
             unparsedInlines
                 |> inlineParseHelper linkReferences
                 |> Block.Paragraph
-                |> just
+                |> Just
+                |> Ok
 
         Html html ->
             Block.HtmlBlock html
-                |> just
+                |> Just
+                |> Ok
 
         UnorderedListBlock unparsedItems ->
             let
@@ -243,41 +270,45 @@ parseInlines linkReferences rawBlock =
                 |> List.map parseItem
                 |> Block.UnorderedList
                 |> Just
-                |> succeed
+                |> Ok
 
         OrderedListBlock startingIndex unparsedInlines ->
             unparsedInlines
                 |> List.map (parseRawInline linkReferences identity)
                 |> Block.OrderedList startingIndex
                 |> Just
-                |> succeed
+                |> Ok
 
         CodeBlock codeBlock ->
             Block.CodeBlock codeBlock
-                |> just
+                |> Just
+                |> Ok
 
         ThematicBreak ->
-            just Block.ThematicBreak
+            Block.ThematicBreak
+                |> Just
+                |> Ok
 
         BlankLine ->
-            succeed Nothing
+            Ok Nothing
 
         BlockQuote rawBlocks ->
             case Advanced.run rawBlockParser rawBlocks of
                 Ok value ->
                     parseAllInlines value
-                        |> map
+                        |> Result.map
                             (\parsedBlocks ->
                                 Block.BlockQuote parsedBlocks
                                     |> Just
                             )
 
                 Err error ->
-                    Advanced.problem (Parser.Problem (deadEndsToString error))
+                    Err (Parser.Problem (deadEndsToString error))
 
         IndentedCodeBlock codeBlockBody ->
             Block.CodeBlock { body = codeBlockBody, language = Nothing }
-                |> just
+                |> Just
+                |> Ok
 
         Table (Markdown.Table.Table header rows) ->
             let
@@ -292,11 +323,7 @@ parseInlines linkReferences rawBlock =
             in
             Block.Table (List.map parseHeader header) []
                 |> Just
-                |> succeed
-
-
-just value =
-    succeed (Just value)
+                |> Ok
 
 
 parseRawInline : LinkReferenceDefinitions -> (List Inline -> a) -> UnparsedInlines -> a
@@ -446,7 +473,7 @@ xmlNodeToHtmlNode parser =
 textNodeToBlocks : String -> List Block
 textNodeToBlocks textNodeValue =
     textNodeValue
-        |> Advanced.run multiParser2
+        |> parse
         |> Result.withDefault []
 
 
@@ -539,7 +566,7 @@ childToParser node =
                     Err err
 
         Text innerText ->
-            case Advanced.run multiParser2 innerText of
+            case parse innerText of
                 Ok value ->
                     Ok value
 
@@ -563,25 +590,6 @@ childToParser node =
 
         Declaration declarationType content ->
             Ok [ Block.HtmlDeclaration declarationType content |> Block.HtmlBlock ]
-
-
-multiParser2 : Parser (List Block)
-multiParser2 =
-    rawBlockParser
-        |. succeed Advanced.end
-        |> andThen parseAllInlines
-        -- TODO find a more elegant way to exclude empty blocks for each blank lines
-        |> map
-            (List.filter
-                (\item ->
-                    case item of
-                        Block.Paragraph [] ->
-                            False
-
-                        _ ->
-                            True
-                )
-            )
 
 
 type alias LinkReferenceDefinitions =
@@ -610,31 +618,27 @@ rawBlockParser =
         statementsHelp2
 
 
-parseAllInlines : State -> Parser (List Block)
+parseAllInlines : State -> Result Parser.Problem (List Block)
 parseAllInlines state =
-    let
-        linkReferences =
-            state.linkReferenceDefinitions
+    parseAllInlinesHelp state state.rawBlocks []
 
-        looper ( rawBlocks, parsedBlocks ) =
-            case rawBlocks of
-                rawBlock :: rest ->
-                    rawBlock
-                        |> parseInlines linkReferences
-                        |> map
-                            (\maybeNewParsedBlock ->
-                                case maybeNewParsedBlock of
-                                    Just newParsedBlock ->
-                                        Loop ( rest, newParsedBlock :: parsedBlocks )
 
-                                    Nothing ->
-                                        Loop ( rest, parsedBlocks )
-                            )
+parseAllInlinesHelp : State -> List RawBlock -> List Block -> Result Parser.Problem (List Block)
+parseAllInlinesHelp state rawBlocks parsedBlocks =
+    case rawBlocks of
+        rawBlock :: rest ->
+            case parseInlines state.linkReferenceDefinitions rawBlock of
+                Ok (Just newParsedBlock) ->
+                    parseAllInlinesHelp state rest (newParsedBlock :: parsedBlocks)
 
-                [] ->
-                    succeed (Done parsedBlocks)
-    in
-    Advanced.loop ( state.rawBlocks, [] ) looper
+                Ok Nothing ->
+                    parseAllInlinesHelp state rest parsedBlocks
+
+                Err e ->
+                    Err e
+
+        [] ->
+            Ok parsedBlocks
 
 
 possiblyMergeBlocks : State -> RawBlock -> State

@@ -220,7 +220,13 @@ toHeadingLevel level =
             Err ("A heading with 1 to 6 #'s, but found " ++ String.fromInt level |> Parser.Expecting)
 
 
-parseInlines : LinkReferenceDefinitions -> RawBlock -> Result Parser.Problem (Maybe Block)
+type InlineResult
+    = EmptyBlock
+    | ParsedBlock Block
+    | InlineProblem Parser.Problem
+
+
+parseInlines : LinkReferenceDefinitions -> RawBlock -> InlineResult
 parseInlines linkReferences rawBlock =
     case rawBlock of
         Heading level unparsedInlines ->
@@ -228,23 +234,20 @@ parseInlines linkReferences rawBlock =
                 Ok parsedLevel ->
                     inlineParseHelper linkReferences unparsedInlines
                         |> Block.Heading parsedLevel
-                        |> Just
-                        |> Ok
+                        |> ParsedBlock
 
                 Err err ->
-                    Err err
+                    InlineProblem err
 
         Body unparsedInlines ->
             unparsedInlines
                 |> inlineParseHelper linkReferences
                 |> Block.Paragraph
-                |> Just
-                |> Ok
+                |> ParsedBlock
 
         Html html ->
             Block.HtmlBlock html
-                |> Just
-                |> Ok
+                |> ParsedBlock
 
         UnorderedListBlock unparsedItems ->
             let
@@ -269,46 +272,41 @@ parseInlines linkReferences rawBlock =
             unparsedItems
                 |> List.map parseItem
                 |> Block.UnorderedList
-                |> Just
-                |> Ok
+                |> ParsedBlock
 
         OrderedListBlock startingIndex unparsedInlines ->
             unparsedInlines
                 |> List.map (parseRawInline linkReferences identity)
                 |> Block.OrderedList startingIndex
-                |> Just
-                |> Ok
+                |> ParsedBlock
 
         CodeBlock codeBlock ->
             Block.CodeBlock codeBlock
-                |> Just
-                |> Ok
+                |> ParsedBlock
 
         ThematicBreak ->
             Block.ThematicBreak
-                |> Just
-                |> Ok
+                |> ParsedBlock
 
         BlankLine ->
-            Ok Nothing
+            EmptyBlock
 
         BlockQuote rawBlocks ->
             case Advanced.run rawBlockParser rawBlocks of
                 Ok value ->
-                    parseAllInlines value
-                        |> Result.map
-                            (\parsedBlocks ->
-                                Block.BlockQuote parsedBlocks
-                                    |> Just
-                            )
+                    case parseAllInlines value of
+                        Ok parsedBlocks ->
+                            ParsedBlock (Block.BlockQuote parsedBlocks)
+
+                        Err error ->
+                            InlineProblem error
 
                 Err error ->
-                    Err (Parser.Problem (deadEndsToString error))
+                    InlineProblem (Parser.Problem (deadEndsToString error))
 
         IndentedCodeBlock codeBlockBody ->
             Block.CodeBlock { body = codeBlockBody, language = Nothing }
-                |> Just
-                |> Ok
+                |> ParsedBlock
 
         Table (Markdown.Table.Table header rows) ->
             let
@@ -322,8 +320,7 @@ parseInlines linkReferences rawBlock =
                     parseRawInline linkReferences wrap (UnparsedInlines label)
             in
             Block.Table (List.map parseHeader header) []
-                |> Just
-                |> Ok
+                |> ParsedBlock
 
 
 parseRawInline : LinkReferenceDefinitions -> (List Inline -> a) -> UnparsedInlines -> a
@@ -628,13 +625,13 @@ parseAllInlinesHelp state rawBlocks parsedBlocks =
     case rawBlocks of
         rawBlock :: rest ->
             case parseInlines state.linkReferenceDefinitions rawBlock of
-                Ok (Just newParsedBlock) ->
+                ParsedBlock newParsedBlock ->
                     parseAllInlinesHelp state rest (newParsedBlock :: parsedBlocks)
 
-                Ok Nothing ->
+                EmptyBlock ->
                     parseAllInlinesHelp state rest parsedBlocks
 
-                Err e ->
+                InlineProblem e ->
                     Err e
 
         [] ->
